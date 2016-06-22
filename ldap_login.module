@@ -1,0 +1,197 @@
+<?php
+/**
+ * @file
+ * LDAP login. Main hooks and functions.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function ldap_login_menu() {
+  $items = array();
+
+  // Module admin configuration.
+  $items['admin/config/people/ldap'] = array(
+    'title'            => 'LDAP connection',
+    'description'      => 'Configure connection settings.',
+    'access arguments' => array('administer site configuration'),
+    'page callback'    => 'drupal_get_form',
+    'page arguments'   => array('ldap_login_settings_form'),
+    'type'             => MENU_NORMAL_ITEM,
+    'file'             => 'ldap_login.admin.inc',
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function ldap_login_form_user_login_alter(&$form, &$form_state) {
+  // Includes the adLDAP library.
+  require_once(DRUPAL_ROOT . '/' . libraries_get_path('adLDAP') . '/src/adLDAP.php');
+  // Validates on LDAP before the Drupal core validation.
+  array_unshift($form['#validate'], '_ldap_login_validate_ldap_user');
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function ldap_login_form_user_login_block_alter(&$form, &$form_state) {
+  // Includes the adLDAP library.
+  require_once(DRUPAL_ROOT . '/' . libraries_get_path('adLDAP') . '/src/adLDAP.php');
+  // Validates on LDAP before the Drupal core validation.
+  array_unshift($form['#validate'], '_ldap_login_validate_ldap_user');
+}
+
+/**
+ * Validate handler to try to authenticate the user on LDAP.
+ */
+function _ldap_login_validate_ldap_user($form, &$form_state) {
+  // Get the LDAP configuration.
+  $options = _ldap_login_get_ldap_settings();
+
+  // Make the LDAP connection.
+  try {
+    $adldap = new adLDAP($options);
+  }
+  catch (adLDAPException $e) {
+    // Throws an error to the user.
+    drupal_set_message(t('An error occurred while trying to log you in.'), 'error');
+
+    // Logs the errors into the DB.
+    watchdog('ldap_login', $e, array(), WATCHDOG_NOTICE, 'error_login');
+  }
+
+  // User info from the form submission.
+  $user_name = $form_state['values']['name'];
+  $user_pass = $form_state['values']['pass'];
+
+  if (is_object($adldap)) {
+    // Tries to authenticate the user.
+    $ldap_is_user = $adldap->authenticate($user_name, $user_pass);
+  }
+
+  // Checks if the user exists on LDAP. If not, jump to normal Drupal workflow.
+  // If the user exists, check if it's a Drupal user already. If not create.
+  if ($ldap_is_user) {
+    // Get the user mail from the AD.
+    $ldap_user = $adldap->user()->infoCollection($user_name);
+
+    // Check if the user is already a Drupal user.
+    // TODO: remove this mail creation once all the users from LDAP have the respective email.
+    $user_mail = isset($ldap_user->mail) ? $ldap_user->mail : rand('1', '1000') . '@drupalized.co';
+
+    // Load the user.
+    $user = user_load_by_mail($user_mail);
+    $user = !empty($user) ? $user : user_load_by_name($user_name);
+
+    // If it is a Drupal user, update based on user account.
+    $user_account = (!empty($user) && isset($user->uid)) ? $user : '';
+
+    // Get the roles according to the ones mapped on the Drupal admin interface.
+    $drupal_user = array(
+      'name'   => $user_name,
+      'pass'   => $user_pass,
+      'mail'   => $user_mail,
+      'status' => 1,
+      'init'   => $user_mail,
+      'roles'  => _ldap_login_get_mapped_roles($ldap_user->memberOf),
+    );
+
+    // Allow other modules to modify the user entity in case of custom fields.
+    if (sizeof(module_implements('ldap_login_user_alter')) > 0) {
+      // Call all modules that implement the hook, and let them make changes to $drupal_user.
+      $drupal_user = module_invoke_all('ldap_login_user_alter', $drupal_user);
+    }
+
+    // If the first parameter is sent blank, a new user is created.
+    // Otherwise, user is updated.
+    user_save($user_account, $drupal_user);
+  }
+}
+
+/**
+ * Function to return the module admin configuration.
+ * 
+ * @return array $options
+ *   The admin settings.
+ */
+function _ldap_login_get_ldap_settings() {
+  // Get the settings from the Drupal configuration page
+  // and return the configuration extracted.
+  return array(
+    'domain_controllers' => array(variable_get('ldap_login_domain_controllers', '')),
+    'account_suffix'     => variable_get('ldap_login_account_suffix', ''),
+    'base_dn'            => variable_get('ldap_login_base_dn', ''),
+    'admin_username'     => variable_get('ldap_login_admin_user', ''),
+    'admin_password'     => variable_get('ldap_login_admin_password', ''),
+    'real_primarygroup'  => (bool) variable_get('ldap_login_real_primarygroup', TRUE),
+    'use_ssl'            => (bool) variable_get('ldap_login_use_ssl', FALSE),
+    'use_tls'            => (bool) variable_get('ldap_login_use_tls', FALSE),
+    'recursive_groups'   => (bool) variable_get('ldap_login_recursive_groups', TRUE),
+    'ad_port'            => (int) variable_get('ldap_login_port', 389),
+    'sso'                => (bool) variable_get('ldap_login_sso', FALSE),
+  );
+}
+
+/**
+ * Function to get the mapped roles on the admin configuration.
+ *
+ * @param array $user_roles_ldap
+ *   The roles from the LDAP connection.
+ *
+ * @return array $user_roles
+ *   The roles for the new user.
+ */
+function _ldap_login_get_mapped_roles($user_roles_ldap) {
+  // Always assign at least the authenticated user role.
+  $user_roles = array(
+    DRUPAL_AUTHENTICATED_RID => 'authenticated user'
+  );
+
+  // Load the drupal roles and get the mapping.
+  foreach (user_roles() as $rid => $role) {
+    // Get the variable set for each role.
+    $current_role_configuration = variable_get('ldap_login_role_mapping_' . $rid, '');
+
+    // Get the mapped roles.
+    if (!empty($current_role_configuration)) {
+      $mapped_roles = explode(', ', $current_role_configuration);
+
+      // Check if roles and LDAP user groups match.
+      foreach ($user_roles_ldap as $user_group) {
+        foreach ($mapped_roles as $group_name) {
+          if (strpos($user_group, $group_name) !== FALSE) {
+            $user_roles[$rid] = $role;
+          }
+        }
+      }
+    }
+  }
+
+  return $user_roles;
+}
+
+/**
+ * Function to decode the objectsid property from the AD.
+ *
+ * @param string $objectsid
+ *   The decoded value of the property.
+ *
+ * @return string $md5_objectsid
+ *   The decoded value on MD5.
+ */
+function _ldap_login_decode_objectsid ($objectsid) {
+  $sid_hex    = unpack('H*hex', $objectsid);
+  $sid_hex    = $sid_hex['hex'];
+  $sub_auths  = unpack('H2/H2/n/N/V*', $objectsid);
+  $rev_level  = hexdec(substr($sid_hex, 0, 2));
+  $auth_ident = hexdec(substr($sid_hex, 4, 12));
+
+  // Decode and md5.
+  $decoded_objectsid = 'S-' . $rev_level . '-' . $auth_ident . '-' . implode('-', $sub_auths);
+  $md5_objectsid     = md5($decoded_objectsid);
+
+  return $md5_objectsid;
+}

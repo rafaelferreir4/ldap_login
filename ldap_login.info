@@ -1,0 +1,6 @@
+name = LDAP Login
+description = LDAP bridge login between Drupal and LDAP.
+core = 7.x
+package = User Management
+
+dependencies[] = libraries
